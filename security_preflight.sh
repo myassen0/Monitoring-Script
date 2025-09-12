@@ -24,23 +24,50 @@ title(){
   echo "--------------------------+----------+-------------------------------------"
 }
 have(){ command -v "$1" &>/dev/null; }
+val(){ [[ -n "${1:-}" ]] && echo "$1" || echo "-"; }
 
 BLOCKERS=0
+
+# ------------------------------------------------------------
+title "Host facts"
+OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-RHEL}")"
+KERNEL="$(uname -r 2>/dev/null || true)"
+ARCH="$(uname -m 2>/dev/null || true)"
+SYSD_VER="$(systemctl --version 2>/dev/null | head -n1 | xargs || true)"
+ok "OS"        "$(val "$OS")"        " "
+ok "Kernel"    "$(val "$KERNEL")"    " "
+ok "Arch"      "$(val "$ARCH")"      "Expect x86_64"
+ok "systemd"   "$(val "$SYSD_VER")"  " "
+
+# ------------------------------------------------------------
+title "Filesystem layout (/app, /logs)"
+for d in /app /logs; do
+  if [[ -d "$d" ]]; then
+    if [[ -w "$d" ]]; then
+      ok "$d" "present" "writable"
+    else
+      warn "$d" "present" "not writable for current user"
+    fi
+  else
+    warn "$d" "missing" "create before data/log usage"
+  fi
+done
+# Capacity snapshot (if paths exist)
+df -h /app /logs 2>/dev/null | sed 's/^/  /'
 
 # ------------------------------------------------------------
 title "SELinux"
 if have getenforce; then
   MODE="$(getenforce 2>/dev/null || true)"
   case "$MODE" in
-    Enforcing) ok "SELinux mode" "$MODE" "Policy is enforced";;
-    Permissive) warn "SELinux mode" "$MODE" "Allowed now, may block later in prod";;
-    Disabled) warn "SELinux mode" "$MODE" "No confinement — consider enabling";;
-    *) warn "SELinux mode" "$MODE" "Unknown mode";;
+    Enforcing) ok "mode" "$MODE" "Policy is enforced";;
+    Permissive) warn "mode" "$MODE" "Allowed now, may block later in prod";;
+    Disabled) warn "mode" "$MODE" "No confinement — consider enabling";;
+    *) warn "mode" "$MODE" "Unknown mode";;
   esac
 else
-  warn "SELinux tools" "missing" "getenforce not found"
+  warn "tools" "missing" "getenforce not found"
 fi
-
 have semanage && ok "semanage" "present" "Ready to label custom paths" \
                  || warn "semanage" "missing" "If using /app or /logs, labeling may be needed"
 
@@ -73,7 +100,7 @@ systemctl is-active  auditd &>/dev/null && AAC=active  || AAC=inactive
 [[ "$AAC" = active ]] && ok "auditd" "$AEN/$AAC" "Kernel auditing running" \
                       || warn "auditd" "$AEN/$AAC" "Not critical for stack, but good to have"
 
-have journalctl && ok "journald" "present" "Use as default logging target" \
+have journalctl && ok "journald" "present" "Default logging target" \
                  || warn "journald" "missing" "Unexpected on RHEL"
 
 systemctl is-active --quiet chronyd && ok "chrony" "active" "Time sync ok" \
@@ -93,7 +120,7 @@ if have sshd; then
     warn "sshd -T" "denied" "Run as root for full view"
   fi
 else
-  warn "sshd" "missing" "Not typical on servers"
+  warn "sshd" "missing" "Service not found"
 fi
 
 # ------------------------------------------------------------
@@ -101,7 +128,7 @@ title "Users & Group (monitoring)"
 getent group monitorconfig >/dev/null && ok "group monitorconfig" "exists" " " \
                                    || warn "group monitorconfig" "missing" "Will be created by users-layout script"
 
-for u in exporter prometheus grafana pushgateway node_exporter cexporter; do
+for u in exporter prometheus grafana pushgateway node_exporter cexporter alertmanager; do
   if id "$u" &>/dev/null; then
     SH=$(getent passwd "$u" | awk -F: '{print $7}')
     ok "user $u" "exists" "shell=$SH"
