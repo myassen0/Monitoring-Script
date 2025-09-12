@@ -39,4 +39,3 @@ else
 fi
 
 echo "NOTE: re-login (or run: newgrp $GROUP_CFG) so your shell picks up the group."
-
