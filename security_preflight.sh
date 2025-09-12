@@ -1,9 +1,9 @@
 #!/bin/bash
 # Security Preflight for RHEL 9.x — NO CHANGES, NO INSTALLS
-# Usage: sudo ./security_preflight.sh [--ports "9090,9100,9091,3000"] [--strict]
+# Usage: sudo ./security_preflight.sh [--ports "9090,9100,9091,3000,9093"] [--strict]
 
 set -euo pipefail
-PORTS="9090,9100,9091,3000"
+PORTS="9090,9100,9091,3000,9093"
 STRICT=0
 
 for arg in "$@"; do
