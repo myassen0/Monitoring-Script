@@ -1,8 +1,4 @@
 #!/bin/bash
-set -euo pipefail
-IFS=$'\n\t'
-
-# -----------------------------------------------------------------------------
 # Prometheus (user-mode) installer for RHEL 9.x
 # - Installs official Prometheus + promtool for the *primary login user* (not system-wide)
 # - Binaries go under $HOME/bin so you can update later without sudo
@@ -169,7 +165,7 @@ chown -R "$RUN_UID:$RUN_GID" "$RUN_HOME/.config" "$USER_SYSTEMD_DIR"
 CONSOLE_FLAGS=""
 if [[ "$COPIED_CONSOLES" -eq 1 ]]; then
   CONSOLE_FLAGS="\\
-  --web.console.templates=/etc/prometheus/consoles \\ 
+  --web.console.templates=/etc/prometheus/consoles \\
   --web.console.libraries=/etc/prometheus/console_libraries \\" 
 fi
 
@@ -190,8 +186,8 @@ WorkingDirectory=/app/prometheus
 ExecStartPre=%h/bin/promtool check config /etc/prometheus/prometheus.yml
 
 # Main process (no explicit WAL flag; default behavior is used)
-ExecStart=%h/bin/prometheus \\ 
-  --config.file=/etc/prometheus/prometheus.yml ${CONSOLE_FLAGS}
+ExecStart=%h/bin/prometheus \\
+  --config.file=/etc/prometheus/prometheus.yml ${CONSOLE_FLAGS} \\
   --storage.tsdb.path=/app/prometheus \\
   --web.listen-address=:${PORT} \\
   --storage.tsdb.retention.time=${RETENTION} \\
