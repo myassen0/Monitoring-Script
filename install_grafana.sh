@@ -1,190 +1,225 @@
 #!/bin/bash
+# Grafana (user-mode) installer for RHEL 9.x
+# - Installs grafana-server + grafana + grafana-cli for the primary login user
+# - Binaries go to $HOME/bin (easy self-update later without sudo)
+# - Uses /etc/grafana, /app/grafana, /logs/grafana layout (created earlier by bootstrap)
+# - Copies full Grafana distribution to /app/grafana/home and runs with --homepath there
+# - Creates a systemd --user unit and starts it (logs via journald)
+#
+# Usage:
+#   chmod +x install_grafana.sh
+#   sudo ./install_grafana.sh
+#
+# Verify:
+#   systemctl --user status grafana
+#   journalctl _SYSTEMD_USER_UNIT=grafana.service -f
+#   curl -sf localhost:3000/login >/dev/null && echo "GRAFANA UP"
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# -----------------------------------------------------------------------------
-# Grafana OSS installer for RHEL 9.6 (x86_64)
-# - Downloads official OSS tarball and verifies SHA256
-# - Installs Grafana under /usr/local/lib/grafana; binary in /usr/local/bin/grafana
-# - Runs as invoking login user
-# - Stores data in /app/grafana
-# - Stores logs in /logs/grafana/grafana.log (with logrotate + journald)
-# - Stores config in /etc/grafana/grafana.ini (world-writable by request)
-# - Uses `grafana server` modern entrypoint
-# - Service supports reload via SIGHUP
-# -----------------------------------------------------------------------------
+# ----------------------------- Tunables ---------------------------------------
+GRAFANA_VERSION="${GRAFANA_VERSION:-12.1.1}"
+PORT="${PORT:-3000}"
+# ------------------------------------------------------------------------------
 
-GRAFANA_VERSION="12.1.1"                                # Grafana OSS version
-GRAFANA_PORT="3000"                                     # Web port
+RUN_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un)}"
+RUN_UID="$(id -u "$RUN_USER")"
+RUN_GID="$(id -g "$RUN_USER")"
+RUN_HOME="$(getent passwd "$RUN_USER" | awk -F: '{print $6}')"
+BIN_DIR="$RUN_HOME/bin"
 
-GRAFANA_PREFIX="/usr/local/lib/grafana"                 # Install path
-GRAFANA_BIN="/usr/local/bin/grafana"                    # Binary path
+GRA_ETC="/etc/grafana"
+GRA_APP="/app/grafana"
+GRA_HOME="$GRA_APP/home"
+GRA_PROV="$GRA_ETC/provisioning"
+GRA_LOG="/logs/grafana"
 
-GRAFANA_DATA="/app/grafana"                             # Data directory
-GRAFANA_CONF_DIR="/etc/grafana"                         # Config directory
-GRAFANA_CONF_FILE="${GRAFANA_CONF_DIR}/grafana.ini"     # Config file
-GRAFANA_LOG_DIR="/logs/grafana"                         # Logs directory
-GRAFANA_LOG_FILE="${GRAFANA_LOG_DIR}/grafana.log"       # Log file
+info(){ echo -e "\e[1;32m==> $*\e[0m"; }
+warn(){ echo -e "\e[33m[WARN]\e[0m $*"; }
+die(){  echo -e "\e[31m[ERR]\e[0m  $*" >&2; exit 1; }
 
-print_status(){ echo -e "\e[1;32m$1\e[0m"; }
+need_cmd(){
+  command -v "$1" &>/dev/null && return 0
+  if [[ ${EUID:-$UID} -eq 0 ]] && command -v dnf &>/dev/null; then
+    info "Installing missing tool: $1"
+    dnf install -y "$2" >/dev/null
+  else
+    die "Missing command: $1 (install package: $2)"
+  fi
+}
 
-# Ensure script runs as root
-if [[ $EUID -ne 0 ]]; then
-  echo "This script must be run with sudo/root" >&2
-  exit 1
-fi
+need_cmd curl curl
+need_cmd tar tar
+need_cmd sha256sum coreutils
+need_cmd systemctl systemd
 
-# Detect user/group
-RUN_USER="${SUDO_USER:-$(id -un)}"
-RUN_GROUP="$(id -gn "$RUN_USER")"
-print_status "==> Service will run as: ${RUN_USER}:${RUN_GROUP}"
+[[ -d "$GRA_ETC" && -w "$GRA_ETC" ]] || die "$GRA_ETC missing or not writable. Run bootstrap first."
+[[ -d "$GRA_APP" && -w "$GRA_APP" ]] || die "$GRA_APP missing or not writable. Run bootstrap first."
+mkdir -p "$GRA_PROV" "$GRA_APP/plugins" "$GRA_LOG"
 
-# Ensure required packages are installed
-declare -A CMD2PKG=(
-  [curl]=curl
-  [tar]=tar
-  [sha256sum]=coreutils
-  [systemctl]=systemd
-  [logrotate]=logrotate
-  [restorecon]=policycoreutils
-  [firewall-cmd]=firewalld
-)
-for cmd in "${!CMD2PKG[@]}"; do
-  command -v "$cmd" &>/dev/null || { print_status "==> Installing ${CMD2PKG[$cmd]}"; dnf install -y "${CMD2PKG[$cmd]}" >/dev/null; }
-done
+chown -R "$RUN_UID:$RUN_GID" "$GRA_LOG"
+chmod 2770 "$GRA_LOG"
 
-# Create directories
-print_status "==> Creating directories..."
-mkdir -p "$GRAFANA_DATA" "$GRAFANA_CONF_DIR" "$GRAFANA_LOG_DIR" /logs
-chown -R "$RUN_USER:$RUN_GROUP" "$GRAFANA_DATA" "$GRAFANA_LOG_DIR"
-chmod 0750 "$GRAFANA_DATA"
-chmod 1777 /logs "$GRAFANA_LOG_DIR" "$GRAFANA_CONF_DIR"
+info "Preparing binaries directory for $RUN_USER: $BIN_DIR"
+mkdir -p "$BIN_DIR"
+chown -R "$RUN_UID:$RUN_GID" "$BIN_DIR"
+chmod 0755 "$BIN_DIR"
 
-# Download tarball + sha256
-print_status "==> Downloading Grafana OSS v${GRAFANA_VERSION}..."
-TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT; cd "$TMPDIR"
+TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
+cd "$TMPDIR"
+
 TARBALL="grafana-${GRAFANA_VERSION}.linux-amd64.tar.gz"
 BASE_URL="https://dl.grafana.com/oss/release"
-curl -fSsLO "${BASE_URL}/${TARBALL}"
-curl -fSsLO "${BASE_URL}/${TARBALL}.sha256" || true
 
-# Verify checksum
-print_status "==> Verifying checksum..."
-if [[ -f "${TARBALL}.sha256" ]]; then
-  if grep -qE '^[a-f0-9]{64}\s{2}' "${TARBALL}.sha256"; then
-    sha256sum -c "${TARBALL}.sha256"
-  else
-    HASH="$(tr -d '\n' < "${TARBALL}.sha256")"
-    echo "${HASH}  ${TARBALL}" | sha256sum -c -
-  fi
+info "Downloading Grafana v${GRAFANA_VERSION}..."
+curl -fsSLO "${BASE_URL}/${TARBALL}"
+curl -fsSLO "${BASE_URL}/${TARBALL}.sha256"
+
+info "Verifying SHA256..."
+if grep -q "${TARBALL}" "${TARBALL}.sha256" 2>/dev/null; then
+  sha256sum -c "${TARBALL}.sha256"
 else
-  echo "WARNING: checksum file not found; computing local hash:" >&2
-  sha256sum "${TARBALL}"
+  expected="$(tr -d ' \n\r' < "${TARBALL}.sha256")"
+  actual="$(sha256sum "${TARBALL}" | awk '{print $1}')"
+  [[ "$expected" == "$actual" ]] || die "SHA256 mismatch: expected ${expected}, got ${actual}"
+  info "SHA256 OK"
 fi
 
-# Extract and install
-print_status "==> Extracting and installing..."
+info "Extracting..."
 tar xf "$TARBALL"
-SRC_DIR="grafana-${GRAFANA_VERSION}"
-install -d "$GRAFANA_PREFIX"
-cp -a "${SRC_DIR}/." "$GRAFANA_PREFIX/"
-install -o root -g root -m 0755 "${GRAFANA_PREFIX}/bin/grafana" "$GRAFANA_BIN"
+cd "grafana-${GRAFANA_VERSION}"
 
-# Install config
-print_status "==> Installing configuration..."
-if [[ -f "${GRAFANA_PREFIX}/conf/sample.ini" ]]; then
-  install -o root -g "$RUN_GROUP" -m 0666 "${GRAFANA_PREFIX}/conf/sample.ini" "$GRAFANA_CONF_FILE"
+info "Installing binaries to $BIN_DIR"
+install -o "$RUN_UID" -g "$RUN_GID" -m 0755 bin/grafana-server "$BIN_DIR/grafana-server"
+install -o "$RUN_UID" -g "$RUN_GID" -m 0755 bin/grafana        "$BIN_DIR/grafana"
+install -o "$RUN_UID" -g "$RUN_GID" -m 0755 bin/grafana-cli    "$BIN_DIR/grafana-cli"
+
+info "Syncing Grafana home (runtime assets) to $GRA_HOME"
+rm -rf "$GRA_HOME"
+mkdir -p "$GRA_HOME"
+shopt -s dotglob extglob
+cp -a !(bin) "$GRA_HOME"/
+shopt -u dotglob extglob
+chown -R "$RUN_UID:$RUN_GID" "$GRA_HOME"
+chmod -R 2750 "$GRA_HOME"
+
+if [[ ! -f "$GRA_ETC/grafana.ini" ]]; then
+  info "Writing default $GRA_ETC/grafana.ini"
+  cat > "$GRA_ETC/grafana.ini" <<'INI'
+[server]
+http_addr =
+http_port = 3000
+
+[paths]
+
+[security]
+admin_user = admin
+admin_password = admin
+
+[log]
+mode = console
+level = warn
+INI
+  chown "$RUN_UID:$RUN_GID" "$GRA_ETC/grafana.ini"
+  chmod 0660 "$GRA_ETC/grafana.ini"
 else
-  install -o root -g "$RUN_GROUP" -m 0666 /dev/null "$GRAFANA_CONF_FILE"
+  info "Existing grafana.ini found; leaving it untouched."
 fi
 
-# Restore SELinux contexts
+mkdir -p "$GRA_PROV"
+chown -R "$RUN_UID:$RUN_GID" "$GRA_ETC"
+chmod -R 2770 "$GRA_ETC"
+
 if command -v restorecon &>/dev/null; then
-  print_status "==> Restoring SELinux contexts..."
-  restorecon -R "$GRAFANA_PREFIX" "$GRAFANA_BIN" "$GRAFANA_DATA" "$GRAFANA_CONF_DIR" "$GRAFANA_LOG_DIR" || true
+  info "Restoring SELinux contexts (if applicable)..."
+  restorecon -RF "$GRA_ETC" "$GRA_APP" "$GRA_LOG" || true
 fi
 
-# Create systemd service
-print_status "==> Creating systemd service..."
-cat > /etc/systemd/system/grafana.service <<UNIT
+USER_SYSTEMD_DIR="$RUN_HOME/.config/systemd/user"
+UNIT_PATH="$USER_SYSTEMD_DIR/grafana.service"
+info "Creating user systemd unit: $UNIT_PATH"
+mkdir -p "$USER_SYSTEMD_DIR"
+chown -R "$RUN_UID:$RUN_GID" "$RUN_HOME/.config" "$USER_SYSTEMD_DIR"
+
+cat > "$UNIT_PATH" <<UNIT
 [Unit]
-Description=Grafana Server
-Documentation=https://grafana.com/docs/grafana/latest/
-Wants=network-online.target
-After=network-online.target
+Description=Grafana (user)
+Documentation=https://grafana.com/docs/
+After=network.target
 
 [Service]
-User=${RUN_USER}
-Group=${RUN_GROUP}
 Type=simple
+UMask=007
+WorkingDirectory=/app/grafana
 
-Environment=GF_PATHS_HOME=${GRAFANA_PREFIX}
-Environment=GF_PATHS_CONFIG=${GRAFANA_CONF_FILE}
-Environment=GF_PATHS_DATA=${GRAFANA_DATA}
-Environment=GF_PATHS_LOGS=${GRAFANA_LOG_DIR}
-Environment=GF_PATHS_PLUGINS=${GRAFANA_DATA}/plugins
-Environment=GF_SERVER_HTTP_PORT=${GRAFANA_PORT}
+Environment=GF_PATHS_CONFIG=/etc/grafana/grafana.ini
+Environment=GF_PATHS_DATA=/app/grafana
+Environment=GF_PATHS_LOGS=/logs/grafana
+Environment=GF_PATHS_PLUGINS=/app/grafana/plugins
+Environment=GF_PATHS_PROVISIONING=/etc/grafana/provisioning
 Environment=GF_LOG_MODE=console
+Environment=GF_LOG_LEVEL=warn
+Environment=GF_SERVER_HTTP_PORT=${PORT}
 
-ExecStart=/bin/bash -c 'umask 000; exec ${GRAFANA_BIN} \
-  server \
-  --homepath=${GRAFANA_PREFIX} \
-  --config=${GRAFANA_CONF_FILE} \
-  &>> ${GRAFANA_LOG_FILE}'
+ExecStart=%h/bin/grafana-server --homepath=/app/grafana/home \
+  --config=/etc/grafana/grafana.ini
 
-ExecReload=/bin/kill -HUP \$MAINPID
-
-StandardOutput=journal
-StandardError=journal
 SyslogIdentifier=grafana
-
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
 LimitNOFILE=65536
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 UNIT
 
-# Configure logrotate
-print_status "==> Setting up logrotate..."
-cat > /etc/logrotate.d/grafana <<LR
-${GRAFANA_LOG_DIR}/*.log {
-  daily
-  rotate 14
-  compress
-  missingok
-  notifempty
-  copytruncate
-  create 0666 ${RUN_USER} ${RUN_GROUP}
-}
-LR
+chown "$RUN_UID:$RUN_GID" "$UNIT_PATH"
+chmod 0644 "$UNIT_PATH"
 
-# Open firewall port if firewalld active
-if systemctl is-active --quiet firewalld; then
-  print_status "==> Opening firewall port ${GRAFANA_PORT}/tcp..."
-  firewall-cmd --add-port=${GRAFANA_PORT}/tcp --permanent >/dev/null || true
-  firewall-cmd --reload >/dev/null || true
+RUN_ENV=( "XDG_RUNTIME_DIR=/run/user/${RUN_UID}" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${RUN_UID}/bus" )
+
+info "Reloading user systemd daemon..."
+sudo -u "$RUN_USER" env "${RUN_ENV[@]}" systemctl --user daemon-reload
+
+if loginctl show-user "$RUN_USER" 2>/dev/null | grep -q 'Linger=yes'; then
+  info "Linger=yes for $RUN_USER (auto-start on boot enabled)"
+else
+  if [[ ${EUID:-$UID} -eq 0 ]]; then
+    info "Enabling lingering for $RUN_USER"
+    loginctl enable-linger "$RUN_USER" || warn "Could not enable lingering automatically"
+  else
+    warn "Lingering not enabled. Ask an admin to: sudo loginctl enable-linger $RUN_USER"
+  fi
 fi
 
-# Enable and start service
-print_status "==> Enabling and starting Grafana..."
-systemctl daemon-reload
-systemctl enable --now grafana
+info "Enabling and starting Grafana (user unit)..."
+sudo -u "$RUN_USER" env "${RUN_ENV[@]}" systemctl --user enable --now grafana.service || true
 
-# Fix ownership and permissions
-chmod 0666 "${GRAFANA_LOG_DIR}"/*.log 2>/dev/null || true
-chown -R "${RUN_USER}:${RUN_GROUP}" "${GRAFANA_DATA}" "${GRAFANA_LOG_DIR}"
+# -------------------------------------------------
+# firewalld
+if command -v firewall-cmd &>/dev/null; then
+  info "Configuring firewall for Grafana (port 3000)..."
+  sudo firewall-cmd --add-port=3000/tcp --permanent || warn "Failed to add port 3000"
+  sudo firewall-cmd --reload || warn "Failed to reload firewall"
+  sudo firewall-cmd --list-ports
+else
+  warn "firewalld not installed, skipped port configuration"
+fi
+# -------------------------------------------------
 
-# Show summary
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-HOST="$(hostname -f 2>/dev/null || hostname)"
-print_status "========== INSTALLATION COMPLETE =========="
-echo "Grafana: $(${GRAFANA_BIN} -v 2>&1 | head -n1)"
-echo "Web UI:  http://${IP:-$HOST}:${GRAFANA_PORT}"
-echo "Service: systemctl status grafana --no-pager -l"
-echo "Data:    ${GRAFANA_DATA}"
+GRA_VER_STR="$("$BIN_DIR/grafana-server" -v 2>&1 || echo "grafana $GRAFANA_VERSION")"
+info "========== INSTALLATION COMPLETE =========="
+echo "Binary:     $GRA_VER_STR"
+echo "Unit:       $UNIT_PATH"
+echo "Config:     $GRA_ETC/grafana.ini"
+echo "Data dir:   $GRA_APP"
+echo "Home path:  $GRA_HOME"
+echo "Web UI:     http://$(hostname -f 2>/dev/null || hostname):${PORT}"
+echo
+echo "Manage:     systemctl --user status grafana"
+echo "Logs:       journalctl _SYSTEMD_USER_UNIT=grafana.service -f"
 echo "Config:  ${GRAFANA_CONF_FILE}"
 echo "Logs:    ${GRAFANA_LOG_FILE}"
 echo "Reload:  sudo systemctl reload grafana"
