@@ -1,4 +1,4 @@
-sudo dnf install -y python3 python3-pip python3-devel gcc make \
+sudo dnf install -y python3 python3-pip python3-pip3 python3-devel gcc make \
                    zlib-devel bzip2 bzip2-devel xz-devel \
                    libffi-devel sqlite sqlite-devel \
                    readline-devel tk-devel openssl-devel \
@@ -16,3 +16,37 @@ pip3 install pandas numpy schedule requests psutil \
              SQLAlchemy oracledb \
              matplotlib seaborn \
              python-dateutil tzdata
+
+
+
+
+#test
+import pandas as pd
+import numpy as np
+import requests
+import sqlalchemy
+import oracledb
+
+print("✅ Python environment looks good!")
+
+# --- Check versions ---
+print("pandas:", pd.__version__)
+print("numpy:", np.__version__)
+print("requests:", requests.__version__)
+print("sqlalchemy:", sqlalchemy.__version__)
+print("oracledb:", oracledb.__version__)
+
+# --- Mini test with pandas/numpy ---
+arr = np.array([1, 2, 3, 4, 5])
+df = pd.DataFrame({"numbers": arr, "squared": arr**2})
+print("\nSample DataFrame:")
+print(df)
+
+# --- Test HTTP request ---
+resp = requests.get("https://httpbin.org/get", timeout=10)
+print("\nHTTP GET status:", resp.status_code)
+print("Response keys:", list(resp.json().keys()))
+
+print("\n🎉 All tests passed, your Python setup is working fine!")
+---------------------
+python3 test_env.py
