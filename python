@@ -4,7 +4,10 @@ sudo dnf install -y python3 python3-pip python3-devel gcc make \
                    readline-devel tk-devel openssl-devel \
                    wget curl git
 
-
+sudo dnf install cpp gcc openssl-devel \
+  --setopt=timeout=600 \
+  --setopt=minrate=10 \
+  --setopt=retries=10
 -----------------------------
 
 pip3 install --upgrade pip setuptools wheel
